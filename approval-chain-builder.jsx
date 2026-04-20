@@ -1,4 +1,9 @@
 import { useState, useRef, useCallback, useEffect, createContext, useContext } from "react";
+import * as chainsApi      from "./src/api/chains.js";
+import * as workflowsApi   from "./src/api/workflows.js";
+import * as connectionsApi from "./src/api/connections.js";
+import * as referenceApi   from "./src/api/reference.js";
+import * as coupaApi       from "./src/api/coupa.js"; // eslint-disable-line no-unused-vars
 
 // ─── IDs ─────────────────────────────────────────────────────────────────────
 let _id = 200;
@@ -540,9 +545,13 @@ function NewApprovalWorkflowPage({ onSave }) {
   const [editForm,    setEditForm]    = useState({});
   const [toast,       setToast]       = useState(null);
 
-  const canvasRef = useRef(null);
-  const getNode   = id => nodes.find(n => n.id === id);
-  const showToast = msg => { setToast(msg); setTimeout(() => setToast(null), 2400); };
+  const [zoom,       setZoom]       = useState(1.0);
+  const [canvasSize, setCanvasSize] = useState({ w: 3000, h: 2000 });
+
+  const canvasRef  = useRef(null); // scrollable viewport
+  const contentRef = useRef(null); // scaled content layer
+  const getNode    = id => nodes.find(n => n.id === id);
+  const showToast  = msg => { setToast(msg); setTimeout(() => setToast(null), 2400); };
 
   // ── Priority handlers — 50 is system-reserved ──
   const handleSliderChange = v => {
@@ -561,13 +570,32 @@ function NewApprovalWorkflowPage({ onSave }) {
 
   // ── Mouse / drag ──
   const handleMouseMove = useCallback(e => {
-    const rect = canvasRef.current?.getBoundingClientRect(); if (!rect) return;
-    setMousePos({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    const sc = canvasRef.current;
+    if (!sc) return;
+    const rect = sc.getBoundingClientRect();
+    // Convert client coords → canvas (unscaled) coords
+    const cx = (e.clientX - rect.left + sc.scrollLeft) / zoom;
+    const cy = (e.clientY - rect.top  + sc.scrollTop)  / zoom;
+    setMousePos({ x: cx, y: cy });
     if (dragNode) {
-      const dx = e.clientX - dragNode.mx, dy = e.clientY - dragNode.my;
-      setNodes(p => p.map(n => n.id === dragNode.id ? { ...n, x: dragNode.ox + dx, y: dragNode.oy + dy } : n));
+      const dx = (e.clientX - dragNode.mx) / zoom;
+      const dy = (e.clientY - dragNode.my) / zoom;
+      const nx = Math.max(0, dragNode.ox + dx);
+      const ny = Math.max(0, dragNode.oy + dy);
+      setNodes(p => p.map(n => n.id === dragNode.id ? { ...n, x: nx, y: ny } : n));
+      // Expand virtual canvas when node approaches the far boundary
+      setCanvasSize(s => ({
+        w: nx + NODE_W + 120 > s.w ? s.w + 800 : s.w,
+        h: ny + NODE_H + 120 > s.h ? s.h + 600 : s.h,
+      }));
+      // Auto-scroll the viewport when cursor is near its edge
+      const THRESHOLD = 64, SPEED = 14;
+      if (e.clientX - rect.left  < THRESHOLD) sc.scrollLeft = Math.max(0, sc.scrollLeft - SPEED);
+      if (rect.right  - e.clientX < THRESHOLD) sc.scrollLeft += SPEED;
+      if (e.clientY - rect.top   < THRESHOLD) sc.scrollTop  = Math.max(0, sc.scrollTop  - SPEED);
+      if (rect.bottom - e.clientY < THRESHOLD) sc.scrollTop  += SPEED;
     }
-  }, [dragNode]);
+  }, [dragNode, zoom]);
   const handleMouseUp = useCallback(() => setDragNode(null), []);
 
   const startDrag = (e, node) => {
@@ -596,17 +624,37 @@ function NewApprovalWorkflowPage({ onSave }) {
   const handleDrop = e => {
     e.preventDefault();
     const type = e.dataTransfer.getData("nodeType"); if (!type) return;
-    const rect    = canvasRef.current.getBoundingClientRect();
+    const sc   = canvasRef.current;
+    const rect = sc.getBoundingClientRect();
+    const x    = (e.clientX - rect.left + sc.scrollLeft) / zoom - NODE_W / 2;
+    const y    = (e.clientY - rect.top  + sc.scrollTop)  / zoom - NODE_H / 2;
     const isTrigger = type.startsWith("trigger_");
     const obj       = WORKFLOW_OBJECTS.find(o => o.type === type);
     setNodes(p => [...p, {
       id:   uid(),
-      x:    e.clientX - rect.left - NODE_W / 2,
-      y:    e.clientY - rect.top  - NODE_H / 2,
+      x:    Math.max(0, x),
+      y:    Math.max(0, y),
       name: isTrigger ? (obj?.label || type) : (type === "watcher" ? "New Watcher" : "New Approver"),
       role: isTrigger ? "Trigger / Entry Point"  : (type === "watcher" ? "Watcher" : "Enter Role"),
       type,
     }]);
+  };
+
+  // Zoom to a new level while keeping the visible center stable
+  const handleZoom = newZ => {
+    const sc = canvasRef.current;
+    if (sc) {
+      const rect = sc.getBoundingClientRect();
+      const canvasCx = (sc.scrollLeft + rect.width  / 2) / zoom;
+      const canvasCy = (sc.scrollTop  + rect.height / 2) / zoom;
+      setZoom(newZ);
+      requestAnimationFrame(() => {
+        sc.scrollLeft = canvasCx * newZ - rect.width  / 2;
+        sc.scrollTop  = canvasCy * newZ - rect.height / 2;
+      });
+    } else {
+      setZoom(newZ);
+    }
   };
 
   useEffect(() => {
@@ -862,133 +910,180 @@ function NewApprovalWorkflowPage({ onSave }) {
       </div>
 
       {/* ═══ CANVAS ═══ */}
-      <div ref={canvasRef}
-        style={{ flex:1, position:"relative", overflow:"hidden",
-          cursor: connectFrom ? "crosshair" : "default",
-          background: t.bg,
-          backgroundImage: t.dots,
-          backgroundSize:"36px 36px", transition:"background 0.25s" }}
-        onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}
-        onClick={handleCanvasClick}
-        onDrop={handleDrop} onDragOver={e => e.preventDefault()}>
+      <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
 
-        {/* SVG edges */}
-        <svg style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", pointerEvents:"none", overflow:"visible" }}>
-          <defs>
-            <marker id="wf-arr"      markerWidth="9" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#1e3560"/></marker>
-            <marker id="wf-arr-live" markerWidth="9" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#f59e0b"/></marker>
-          </defs>
-          {edges.map(edge => {
-            const f  = getNode(edge.from);
-            const tn = getNode(edge.to);
-            const mid = getEdgeMid(edge.from, edge.to);
-            return (
-              <g key={edge.id}>
-                <path d={buildEdgePath(f, tn)} fill="none" stroke="#1e3560" strokeWidth={2} markerEnd="url(#wf-arr)" />
-                <circle cx={mid.x} cy={mid.y} r={9} fill="#0d1321" stroke="#1e3560" strokeWidth={1.5}
-                  style={{ pointerEvents:"all", cursor:"pointer" }} onClick={e => deleteEdge(e, edge.id)} />
-                <text x={mid.x} y={mid.y+4.5} textAnchor="middle" fill="#3b5278" fontSize="11"
-                  style={{ pointerEvents:"none", userSelect:"none" }}>×</text>
-              </g>
-            );
-          })}
-          {connectFrom && liveWireEnd() && (
-            <path d={liveWireEnd()} fill="none" stroke="#f59e0b" strokeWidth={2} strokeDasharray="8 5" markerEnd="url(#wf-arr-live)" />
-          )}
-        </svg>
+        {/* ── Scrollable viewport ── */}
+        <div ref={canvasRef}
+          style={{ position:"absolute", inset:0, overflow:"auto",
+            cursor: connectFrom ? "crosshair" : "default",
+            background: t.bg,
+            backgroundImage: t.dots,
+            backgroundSize:`${36 * zoom}px ${36 * zoom}px`,
+            transition:"background 0.25s" }}
+          onMouseMove={handleMouseMove} onMouseUp={handleMouseUp}
+          onClick={handleCanvasClick}
+          onDrop={handleDrop} onDragOver={e => e.preventDefault()}>
 
-        {/* Nodes */}
-        {nodes.map(node => {
-          const isSel     = selected === node.id;
-          const isTrigger = node.type?.startsWith("trigger_");
-          const isWatcher = node.type === "watcher";
-          const isPar     = node.type === "parallel";
-          const col       = wfNodeColor(node.type);
-          const trigObj   = isTrigger ? WORKFLOW_OBJECTS.find(o => o.type === node.type) : null;
-          return (
-            <div key={node.id}
-              onMouseDown={e => startDrag(e, node)}
-              onDoubleClick={e => !isTrigger && openEdit(e, node)}
-              onClick={e => { e.stopPropagation(); setSelected(node.id); }}
-              style={{
-                position:"absolute", left:node.x, top:node.y, width:NODE_W, height:NODE_H,
-                background: isTrigger
-                  ? `linear-gradient(135deg,${col}20,${col}0a)`
-                  : (isSel ? `linear-gradient(135deg,${col}18,${col}08)` : "linear-gradient(135deg,#0d1625,#090f1c)"),
-                border:       `1px solid ${isSel ? col+"99" : (isTrigger ? col+"40" : "#111c2e")}`,
-                borderLeft:   isTrigger || (!isWatcher && !isPar) ? `3px solid ${col}` : undefined,
-                borderTop:    isPar && !isTrigger ? `3px solid ${col}` : undefined,
-                borderRight:  isWatcher ? `3px solid ${col}` : undefined,
-                borderBottom: isWatcher ? `3px solid ${col}` : undefined,
-                borderRadius: 11,
-                boxShadow:    isSel ? `0 0 0 1px ${col}30,0 10px 36px #00000090` : "0 4px 20px #00000060",
-                cursor:       dragNode?.id === node.id ? "grabbing" : "grab",
-                userSelect:   "none",
-                display:"flex", alignItems:"center", paddingLeft:16, paddingRight:18, gap:10, boxSizing:"border-box",
-              }}>
-              <div style={{ width:36, height:36, borderRadius:"50%", background:col+"18", border:`1.5px solid ${col}44`,
-                display:"flex", alignItems:"center", justifyContent:"center",
-                flexShrink:0, fontSize:isTrigger || isWatcher ? 16 : 14, color:col, fontWeight:700 }}>
-                {isTrigger ? trigObj?.icon : isWatcher ? "👁" : node.name.charAt(0).toUpperCase()}
-              </div>
-              <div style={{ flex:1, overflow:"hidden" }}>
-                <div style={{ fontSize:12, fontWeight:600, color:"#e2e8f0", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{node.name}</div>
-                <div style={{ fontSize:10, color: isTrigger ? col+"99" : "#3b5278", marginTop:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{node.role}</div>
-              </div>
-              <div style={{ position:"absolute", top:6, right:6, fontSize:8, color:col, background:col+"14",
-                border:`1px solid ${col}30`, borderRadius:4, padding:"2px 5px",
-                textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:700 }}>
-                {isTrigger ? "Trigger" : isWatcher ? "Watcher" : node.type}
-              </div>
+          {/* Size spacer — keeps scroll container sized to the virtual canvas */}
+          <div style={{ width: canvasSize.w * zoom, height: canvasSize.h * zoom, flexShrink:0, pointerEvents:"none" }} />
 
-              {/* Output port — all non-watcher nodes */}
-              {!isWatcher && (
-                <div onClick={e => handleOutputPort(e, node.id)} style={{
-                  position:"absolute",
-                  ...(isPar && !isTrigger
-                    ? { bottom:-PORT_R, left:"50%", transform:"translateX(-50%)" }
-                    : { right:-PORT_R, top:"50%", transform:"translateY(-50%)" }),
-                  width:PORT_R*2, height:PORT_R*2, borderRadius:"50%",
-                  background: connectFrom === node.id ? "#f59e0b" : "#070b12",
-                  border:`2px solid ${connectFrom === node.id ? "#f59e0b" : col+"80"}`,
-                  cursor:"pointer", zIndex:3, transition:"all 0.15s",
-                }} />
+          {/* ── Scaled content layer ── */}
+          <div ref={contentRef}
+            style={{ position:"absolute", top:0, left:0,
+              width: canvasSize.w, height: canvasSize.h,
+              transform:`scale(${zoom})`, transformOrigin:"0 0" }}>
+
+            {/* SVG edges */}
+            <svg style={{ position:"absolute", top:0, left:0, width:"100%", height:"100%", pointerEvents:"none", overflow:"visible" }}>
+              <defs>
+                <marker id="wf-arr"      markerWidth="9" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#1e3560"/></marker>
+                <marker id="wf-arr-live" markerWidth="9" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,9 3.5,0 7" fill="#f59e0b"/></marker>
+              </defs>
+              {edges.map(edge => {
+                const f   = getNode(edge.from);
+                const tn  = getNode(edge.to);
+                const mid = getEdgeMid(edge.from, edge.to);
+                return (
+                  <g key={edge.id}>
+                    <path d={buildEdgePath(f, tn)} fill="none" stroke="#1e3560" strokeWidth={2} markerEnd="url(#wf-arr)" />
+                    <circle cx={mid.x} cy={mid.y} r={9} fill="#0d1321" stroke="#1e3560" strokeWidth={1.5}
+                      style={{ pointerEvents:"all", cursor:"pointer" }} onClick={e => deleteEdge(e, edge.id)} />
+                    <text x={mid.x} y={mid.y+4.5} textAnchor="middle" fill="#3b5278" fontSize="11"
+                      style={{ pointerEvents:"none", userSelect:"none" }}>×</text>
+                  </g>
+                );
+              })}
+              {connectFrom && liveWireEnd() && (
+                <path d={liveWireEnd()} fill="none" stroke="#f59e0b" strokeWidth={2} strokeDasharray="8 5" markerEnd="url(#wf-arr-live)" />
               )}
+            </svg>
 
-              {/* Input port — non-watcher, non-trigger nodes */}
-              {!isWatcher && !isTrigger && (
-                <div onClick={e => handleInputPort(e, node.id)} style={{
-                  position:"absolute",
-                  ...(isPar
-                    ? { top:-PORT_R, left:"50%", transform:"translateX(-50%)" }
-                    : { left:-PORT_R, top:"50%", transform:"translateY(-50%)" }),
-                  width:PORT_R*2, height:PORT_R*2, borderRadius:"50%",
-                  background: connectFrom ? "#f59e0b22" : "#070b12",
-                  border:`2px solid ${connectFrom ? "#f59e0b" : "#1e3560"}`,
-                  cursor:"pointer", zIndex:3, transition:"all 0.15s",
-                }} />
-              )}
-            </div>
-          );
-        })}
+            {/* Nodes */}
+            {nodes.map(node => {
+              const isSel     = selected === node.id;
+              const isTrigger = node.type?.startsWith("trigger_");
+              const isWatcher = node.type === "watcher";
+              const isPar     = node.type === "parallel";
+              const col       = wfNodeColor(node.type);
+              const trigObj   = isTrigger ? WORKFLOW_OBJECTS.find(o => o.type === node.type) : null;
+              return (
+                <div key={node.id}
+                  onMouseDown={e => startDrag(e, node)}
+                  onDoubleClick={e => !isTrigger && openEdit(e, node)}
+                  onClick={e => { e.stopPropagation(); setSelected(node.id); }}
+                  style={{
+                    position:"absolute", left:node.x, top:node.y, width:NODE_W, height:NODE_H,
+                    background: isTrigger
+                      ? `linear-gradient(135deg,${col}20,${col}0a)`
+                      : (isSel ? `linear-gradient(135deg,${col}18,${col}08)` : "linear-gradient(135deg,#0d1625,#090f1c)"),
+                    border:       `1px solid ${isSel ? col+"99" : (isTrigger ? col+"40" : "#111c2e")}`,
+                    borderLeft:   isTrigger || (!isWatcher && !isPar) ? `3px solid ${col}` : undefined,
+                    borderTop:    isPar && !isTrigger ? `3px solid ${col}` : undefined,
+                    borderRight:  isWatcher ? `3px solid ${col}` : undefined,
+                    borderBottom: isWatcher ? `3px solid ${col}` : undefined,
+                    borderRadius: 11,
+                    boxShadow:    isSel ? `0 0 0 1px ${col}30,0 10px 36px #00000090` : "0 4px 20px #00000060",
+                    cursor:       dragNode?.id === node.id ? "grabbing" : "grab",
+                    userSelect:   "none",
+                    display:"flex", alignItems:"center", paddingLeft:16, paddingRight:18, gap:10, boxSizing:"border-box",
+                  }}>
+                  <div style={{ width:36, height:36, borderRadius:"50%", background:col+"18", border:`1.5px solid ${col}44`,
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    flexShrink:0, fontSize:isTrigger || isWatcher ? 16 : 14, color:col, fontWeight:700 }}>
+                    {isTrigger ? trigObj?.icon : isWatcher ? "👁" : node.name.charAt(0).toUpperCase()}
+                  </div>
+                  <div style={{ flex:1, overflow:"hidden" }}>
+                    <div style={{ fontSize:12, fontWeight:600, color:"#e2e8f0", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{node.name}</div>
+                    <div style={{ fontSize:10, color: isTrigger ? col+"99" : "#3b5278", marginTop:1, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{node.role}</div>
+                  </div>
+                  <div style={{ position:"absolute", top:6, right:6, fontSize:8, color:col, background:col+"14",
+                    border:`1px solid ${col}30`, borderRadius:4, padding:"2px 5px",
+                    textTransform:"uppercase", letterSpacing:"0.1em", fontWeight:700 }}>
+                    {isTrigger ? "Trigger" : isWatcher ? "Watcher" : node.type}
+                  </div>
 
-        {nodes.length === 0 && (
-          <div style={{ position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%)",
-            textAlign:"center", pointerEvents:"none", userSelect:"none" }}>
-            <div style={{ fontSize:52, marginBottom:14, opacity:0.1 }}>◈</div>
-            <div style={{ fontSize:13, color:t.t3, letterSpacing:"0.12em", textTransform:"uppercase" }}>
-              Drag objects or approvers onto the canvas
-            </div>
-          </div>
-        )}
+                  {/* Output port — all non-watcher nodes */}
+                  {!isWatcher && (
+                    <div onClick={e => handleOutputPort(e, node.id)} style={{
+                      position:"absolute",
+                      ...(isPar && !isTrigger
+                        ? { bottom:-PORT_R, left:"50%", transform:"translateX(-50%)" }
+                        : { right:-PORT_R, top:"50%", transform:"translateY(-50%)" }),
+                      width:PORT_R*2, height:PORT_R*2, borderRadius:"50%",
+                      background: connectFrom === node.id ? "#f59e0b" : "#070b12",
+                      border:`2px solid ${connectFrom === node.id ? "#f59e0b" : col+"80"}`,
+                      cursor:"pointer", zIndex:3, transition:"all 0.15s",
+                    }} />
+                  )}
 
-        {connectFrom && (
-          <div style={{ position:"absolute", top:18, left:"50%", transform:"translateX(-50%)",
-            background:"#f59e0b", color:"#070b12", borderRadius:8, padding:"8px 20px",
-            fontSize:12, fontWeight:700, pointerEvents:"none", boxShadow:"0 4px 20px #f59e0b60" }}>
-            Click the input port of a node to connect — or click canvas to cancel
-          </div>
-        )}
+                  {/* Input port — non-watcher, non-trigger nodes */}
+                  {!isWatcher && !isTrigger && (
+                    <div onClick={e => handleInputPort(e, node.id)} style={{
+                      position:"absolute",
+                      ...(isPar
+                        ? { top:-PORT_R, left:"50%", transform:"translateX(-50%)" }
+                        : { left:-PORT_R, top:"50%", transform:"translateY(-50%)" }),
+                      width:PORT_R*2, height:PORT_R*2, borderRadius:"50%",
+                      background: connectFrom ? "#f59e0b22" : "#070b12",
+                      border:`2px solid ${connectFrom ? "#f59e0b" : "#1e3560"}`,
+                      cursor:"pointer", zIndex:3, transition:"all 0.15s",
+                    }} />
+                  )}
+                </div>
+              );
+            })}
+
+            {nodes.length === 0 && (
+              <div style={{ position:"absolute", top:"50%", left:"50%", transform:"translate(-50%,-50%)",
+                textAlign:"center", pointerEvents:"none", userSelect:"none" }}>
+                <div style={{ fontSize:52, marginBottom:14, opacity:0.1 }}>◈</div>
+                <div style={{ fontSize:13, color:t.t3, letterSpacing:"0.12em", textTransform:"uppercase" }}>
+                  Drag objects or approvers onto the canvas
+                </div>
+              </div>
+            )}
+
+            {connectFrom && (
+              <div style={{ position:"absolute", top:18, left:"50%", transform:"translateX(-50%)",
+                background:"#f59e0b", color:"#070b12", borderRadius:8, padding:"8px 20px",
+                fontSize:12, fontWeight:700, pointerEvents:"none", boxShadow:"0 4px 20px #f59e0b60" }}>
+                Click the input port of a node to connect — or click canvas to cancel
+              </div>
+            )}
+          </div>{/* end scaled content */}
+        </div>{/* end scrollable viewport */}
+
+        {/* ── Zoom controls — always visible, anchored to canvas corner ── */}
+        <div style={{ position:"absolute", bottom:16, right:20, zIndex:20,
+          display:"flex", alignItems:"center", gap:4,
+          background: t.panel, border:`1px solid ${t.bdrS}`,
+          borderRadius:10, padding:"5px 8px", boxShadow:"0 4px 20px #00000060" }}>
+          <button title="Zoom out"
+            onClick={() => handleZoom(Math.max(0.25, parseFloat((zoom - 0.1).toFixed(2))))}
+            style={{ width:26, height:26, background:"transparent", border:`1px solid ${t.bdrS}`,
+              borderRadius:6, color:t.t1, cursor:"pointer", fontSize:16, lineHeight:1,
+              display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"inherit" }}>−</button>
+          <button title="Reset to 100%"
+            onClick={() => handleZoom(1)}
+            style={{ padding:"0 8px", height:26, minWidth:52,
+              background: Math.round(zoom * 100) === 100 ? t.deep : "transparent",
+              border:`1px solid ${t.bdrS}`, borderRadius:6, color:t.amberTxt,
+              cursor:"pointer", fontSize:10, fontWeight:700,
+              fontFamily:"'IBM Plex Mono',monospace" }}>
+            {Math.round(zoom * 100)}%
+          </button>
+          <button title="Zoom in"
+            onClick={() => handleZoom(Math.min(3, parseFloat((zoom + 0.1).toFixed(2))))}
+            style={{ width:26, height:26, background:"transparent", border:`1px solid ${t.bdrS}`,
+              borderRadius:6, color:t.t1, cursor:"pointer", fontSize:16, lineHeight:1,
+              display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"inherit" }}>+</button>
+          <div style={{ width:1, height:16, background:t.bdrS, margin:"0 2px" }} />
+          <button title="Reset view (1:1 + scroll to top-left)"
+            onClick={() => { handleZoom(1); requestAnimationFrame(() => { if (canvasRef.current) { canvasRef.current.scrollLeft = 0; canvasRef.current.scrollTop = 0; } }); }}
+            style={{ width:26, height:26, background:"transparent", border:`1px solid ${t.bdrS}`,
+              borderRadius:6, color:t.t2, cursor:"pointer", fontSize:13, lineHeight:1,
+              display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"inherit" }}>⊡</button>
+        </div>
       </div>
 
       {/* Confirm Delete */}
@@ -2076,8 +2171,14 @@ function ReferenceValuesPage() {
   const [toast,     setToast]     = useState(null);
   const fileInputRef              = useRef(null);
 
+  useEffect(() => {
+    referenceApi.get()
+      .then(data => { setRefs(data); saveRefValues(data); })
+      .catch(() => {});
+  }, []);
+
   const showToast  = msg => { setToast(msg); setTimeout(() => setToast(null), 2800); };
-  const updateRefs = updated => { setRefs(updated); saveRefValues(updated); };
+  const updateRefs = updated => { setRefs(updated); saveRefValues(updated); referenceApi.update(updated).catch(() => {}); };
 
   const addCurrency = ({ code, name }) => {
     updateRefs({ ...refs, currencies: [...refs.currencies, { code, name }] });
@@ -2663,35 +2764,43 @@ function SettingsPage() {
   const [expandedId,   setExpandedId]  = useState(null);
   const [editingConn,  setEditingConn] = useState(null);
 
+  useEffect(() => {
+    connectionsApi.getAll()
+      .then(data => { setConns(data); saveConnections(data); })
+      .catch(() => {});
+  }, []);
+
   const showToast  = msg => { setToast(msg); setTimeout(() => setToast(null), 2400); };
   const persist    = updated => { setConns(updated); saveConnections(updated); };
 
   const handleAdd = form => {
-    persist([...connections, {
-      ...form,
-      id:          `conn_${Date.now()}`,
-      status:      "active",
-      createdDate: new Date().toISOString().slice(0, 10),
-      createdBy:   "Admin",
-    }]);
+    const newConn = { ...form, id: `conn_${Date.now()}`, status: "active", createdDate: new Date().toISOString().slice(0, 10), createdBy: "Admin" };
+    persist([...connections, newConn]);
     setShowAdd(false);
     showToast("Connection added");
+    connectionsApi.upsert(newConn).catch(() => {});
   };
 
   const handleUpdate = form => {
-    persist(connections.map(c => c.id === editingConn.id ? { ...c, ...form } : c));
+    const updated = { ...editingConn, ...form };
+    persist(connections.map(c => c.id === editingConn.id ? updated : c));
     setEditingConn(null);
     showToast("Connection updated");
+    connectionsApi.upsert(updated).catch(() => {});
   };
 
   const handleDelete = id => {
     persist(connections.filter(c => c.id !== id));
     if (expandedId === id) setExpandedId(null);
     showToast("Connection removed");
+    connectionsApi.remove(id).catch(() => {});
   };
 
   const toggleStatus = id => {
-    persist(connections.map(c => c.id === id ? { ...c, status: c.status === "active" ? "inactive" : "active" } : c));
+    const updated = connections.map(c => c.id === id ? { ...c, status: c.status === "active" ? "inactive" : "active" } : c);
+    persist(updated);
+    const conn = updated.find(c => c.id === id);
+    if (conn) connectionsApi.upsert(conn).catch(() => {});
   };
 
   return (
@@ -2869,7 +2978,18 @@ export default function App() {
     document.head.appendChild(link);
   }, []);
 
-  // Persist chains and workflows to localStorage on every change
+  // Hydrate from the backend on mount; silently fall back to localStorage when
+  // the backend is not running (pure-frontend / offline mode).
+  useEffect(() => {
+    chainsApi.getAll()
+      .then(data => { setSavedChains(data); saveChains(data); })
+      .catch(() => {});
+    workflowsApi.getAll()
+      .then(data => { setSavedWorkflows(data); saveWorkflows(data); })
+      .catch(() => {});
+  }, []);
+
+  // Keep localStorage in sync as an offline cache
   useEffect(() => { saveChains(savedChains); }, [savedChains]);
   useEffect(() => { saveWorkflows(savedWorkflows); }, [savedWorkflows]);
 
@@ -2883,6 +3003,7 @@ export default function App() {
     });
     // Stay on new-chain page; update editingChain so subsequent saves use correct id
     setEditingChain(chain);
+    chainsApi.upsert(chain).catch(() => {});
   };
 
   const handleEdit = chain => {
@@ -2892,8 +3013,8 @@ export default function App() {
 
   const handleDelete = id => {
     setSavedChains(prev => prev.filter(c => c.id !== id));
-    // If currently editing the deleted chain, clear it
     if (editingChain?.id === id) setEditingChain(null);
+    chainsApi.remove(id).catch(() => {});
   };
 
   const handleNewChain = () => {
@@ -2903,6 +3024,7 @@ export default function App() {
 
   const handleDeleteWorkflow = id => {
     setSavedWorkflows(prev => prev.filter(w => w.id !== id));
+    workflowsApi.remove(id).catch(() => {});
   };
 
   const handleSaveWorkflow = workflow => {
@@ -2911,6 +3033,7 @@ export default function App() {
       if (idx >= 0) { const n = [...prev]; n[idx] = workflow; return n; }
       return [...prev, workflow];
     });
+    workflowsApi.upsert(workflow).catch(() => {});
   };
 
   const renderPage = () => {
